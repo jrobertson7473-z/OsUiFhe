@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract OsUiFhe is SepoliaConfig {
+    struct EncryptedUsageData {
+        uint256 dataId;
+        address user;
+        euint32 encryptedAppUsage;
+        euint32 encryptedTimeSpent;
+        euint32 encryptedInteractionPattern;
+        euint32 encryptedTimeOfDay;
+        uint256 timestamp;
+    }
+
+    struct UiConfiguration {
+        string layoutPreference;
+        string featureRecommendation;
+        string workflowSuggestion;
+        bool isRevealed;
+    }
+
+    uint256 public dataCount;
+    mapping(uint256 => EncryptedUsageData) public usageData;
+    mapping(uint256 => UiConfiguration) public uiConfigs;
+    mapping(uint256 => uint256) private requestToDataId;
+
+    event DataCollected(uint256 indexed dataId, address indexed user);
+    event AnalysisRequested(uint256 indexed dataId);
+    event ConfigurationReady(uint256 indexed dataId);
+
+    modifier onlyUser(uint256 dataId) {
+        require(msg.sender == usageData[dataId].user, "Not authorized");
+        _;
+    }
+
+    function submitEncryptedUsage(
+        euint32 appUsage,
+        euint32 timeSpent,
+        euint32 interactionPattern,
+        euint32 timeOfDay
+    ) public {
+        dataCount += 1;
+        uint256 newId = dataCount;
+
+        usageData[newId] = EncryptedUsageData({
+            dataId: newId,
+            user: msg.sender,
+            encryptedAppUsage: appUsage,
+            encryptedTimeSpent: timeSpent,
+            encryptedInteractionPattern: interactionPattern,
+            encryptedTimeOfDay: timeOfDay,
+            timestamp: block.timestamp
+        });
+
+        uiConfigs[newId] = UiConfiguration({
+            layoutPreference: "",
+            featureRecommendation: "",
+            workflowSuggestion: "",
+            isRevealed: false
+        });
+
+        emit DataCollected(newId, msg.sender);
+    }
+
+    function requestUiAnalysis(uint256 dataId) public onlyUser(dataId) {
+        require(!uiConfigs[dataId].isRevealed, "Already analyzed");
+
+        EncryptedUsageData storage data = usageData[dataId];
+        
+        bytes32[] memory ciphertexts = new bytes32[](4);
+        ciphertexts[0] = FHE.toBytes32(data.encryptedAppUsage);
+        ciphertexts[1] = FHE.toBytes32(data.encryptedTimeSpent);
+        ciphertexts[2] = FHE.toBytes32(data.encryptedInteractionPattern);
+        ciphertexts[3] = FHE.toBytes32(data.encryptedTimeOfDay);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.generateUiConfig.selector);
+        requestToDataId[reqId] = dataId;
+
+        emit AnalysisRequested(dataId);
+    }
+
+    function generateUiConfig(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 dataId = requestToDataId[requestId];
+        require(dataId != 0, "Invalid request");
+
+        UiConfiguration storage config = uiConfigs[dataId];
+        require(!config.isRevealed, "Already revealed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        (uint32 appUsage, 
+         uint32 timeSpent, 
+         uint32 interactionPattern, 
+         uint32 timeOfDay) = abi.decode(cleartexts, (uint32, uint32, uint32, uint32));
+        
+        (config.layoutPreference,
+         config.featureRecommendation,
+         config.workflowSuggestion) = _calculateUiPreferences(appUsage, timeSpent, interactionPattern, timeOfDay);
+        
+        config.isRevealed = true;
+
+        emit ConfigurationReady(dataId);
+    }
+
+    function _calculateUiPreferences(
+        uint32 appUsage,
+        uint32 timeSpent,
+        uint32 interactionPattern,
+        uint32 timeOfDay
+    ) private pure returns (
+        string memory,
+        string memory,
+        string memory
+    ) {
+        string memory layout;
+        string memory feature;
+        string memory workflow;
+
+        // Layout determination
+        if (interactionPattern > 70) {
+            layout = "Compact";
+        } else if (interactionPattern > 40) {
+            layout = "Balanced";
+        } else {
+            layout = "Spacious";
+        }
+
+        // Feature recommendation
+        if (appUsage > 80 && timeSpent > 60) {
+            feature = "Advanced Tools";
+        } else if (appUsage > 50) {
+            feature = "Quick Access";
+        } else {
+            feature = "Basic Functions";
+        }
+
+        // Workflow suggestion
+        if (timeOfDay < 12) {
+            workflow = "Morning Productivity";
+        } else if (timeOfDay < 18) {
+            workflow = "Afternoon Focus";
+        } else {
+            workflow = "Evening Relaxation";
+        }
+
+        return (layout, feature, workflow);
+    }
+
+    function getUiConfiguration(uint256 dataId) public view onlyUser(dataId) returns (
+        string memory layout,
+        string memory feature,
+        string memory workflow,
+        bool isRevealed
+    ) {
+        UiConfiguration storage c = uiConfigs[dataId];
+        return (c.layoutPreference, c.featureRecommendation, c.workflowSuggestion, c.isRevealed);
+    }
+
+    function calculateEncryptedUsageScore(
+        euint32 appUsage,
+        euint32 timeSpent,
+        euint32 interactionPattern
+    ) public pure returns (euint32) {
+        euint32 usageFactor = FHE.mul(appUsage, FHE.asEuint32(3));
+        euint32 timeFactor = FHE.mul(timeSpent, FHE.asEuint32(2));
+        euint32 interactionFactor = interactionPattern;
+        
+        return FHE.div(
+            FHE.add(FHE.add(usageFactor, timeFactor), interactionFactor),
+            FHE.asEuint32(6)
+        );
+    }
+
+    function getDataTimestamp(uint256 dataId) public view returns (uint256) {
+        return usageData[dataId].timestamp;
+    }
+
+    function verifyUsagePattern(
+        euint32 currentPattern,
+        euint32 historicalPattern,
+        euint32 threshold
+    ) public pure returns (ebool) {
+        euint32 difference = FHE.sub(currentPattern, historicalPattern);
+        return FHE.gt(FHE.abs(difference), threshold);
+    }
+}
